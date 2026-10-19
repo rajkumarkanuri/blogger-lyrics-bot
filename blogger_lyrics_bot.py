@@ -286,7 +286,7 @@ def notify_search_engines(post_url: str):
 # =====================================================================
 # 7. TELEGRAM AUTO-BROADCASTER
 # =====================================================================
-def send_telegram_notification(song_name: str, movie_name: str, post_url: str, thumb_url: str):
+def send_telegram_notification(song_name: str, movie_name: str, post_url: str, yt_id: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     
@@ -297,6 +297,9 @@ def send_telegram_notification(song_name: str, movie_name: str, post_url: str, t
     message = f"🎵 *New Telugu Song Lyrics Published!*\n\n" \
               f"✨ *{song_name}* - *{movie_name}*\n\n" \
               f"📖 Read Telugu & English Lyrics, FAQs, and watch the official video here:\n{post_url}"
+
+    # Try high-res thumbnail first, fallback to standard hqdefault if needed
+    thumb_url = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
 
     payload = {
         "chat_id": chat_id,
@@ -310,7 +313,14 @@ def send_telegram_notification(song_name: str, movie_name: str, post_url: str, t
         if resp.status_code == 200:
             print(" -> Successfully sent Telegram notification!")
         else:
-            print(f" -> Telegram error: {resp.text}")
+            print(f" -> Telegram photo error ({resp.text}), sending text-only fallback...")
+            # Fallback to text message if photo fails
+            text_payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown"
+            }
+            requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=text_payload, timeout=10)
     except Exception as e:
         print(f" -> Telegram warning: {e}")
 
