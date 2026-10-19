@@ -2,6 +2,7 @@ import os
 import re
 import json
 import urllib.parse
+from datetime import datetime
 import requests
 import feedparser
 from bs4 import BeautifulSoup
@@ -191,6 +192,9 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
             }
         })
 
+    # ISO 8601 upload date required for Google VideoObject schema
+    current_upload_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
     # Build Google Rich Results JSON-LD Schema (FAQPage + VideoObject)
     json_ld_data = {
         "@context": "https://schema.org",
@@ -204,6 +208,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
                 "name": f"{s_name} Lyrical Video - {m_name}",
                 "description": data.seo_meta_description,
                 "thumbnailUrl": [thumb_url],
+                "uploadDate": current_upload_date,
                 "embedUrl": f"https://www.youtube.com/embed/{yt_id}"
             }
         ]
@@ -266,7 +271,21 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 </div>"""
 
 # =====================================================================
-# 6. TWO-STEP SEO PUBLISH (CUSTOM URL SLUG + HIGH-CTR DISPLAY TITLE)
+# 6. AUTO-PING GOOGLE & BING SITEMAPS UPON PUBLISH
+# =====================================================================
+def notify_search_engines(post_url: str):
+    try:
+        parsed = urllib.parse.urlparse(post_url)
+        sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+        
+        requests.get(f"https://www.google.com/ping?sitemap={urllib.parse.quote(sitemap_url)}", timeout=5)
+        requests.get(f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url)}", timeout=5)
+        print(" -> Successfully notified Google and Bing to crawl the sitemap!")
+    except Exception as e:
+        print(f" -> Sitemap ping warning: {e}")
+
+# =====================================================================
+# 7. TWO-STEP SEO PUBLISH & INDEX TRIGGER
 # =====================================================================
 def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, raw_html: str, labels: list[str]):
     if os.path.exists("token.json"):
@@ -279,8 +298,6 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
 
     service = build("blogger", "v3", credentials=creds)
 
-    # Step 1: Insert using short 'url_slug_title' so Blogger creates a clean SEO URL
-    # e.g., https://yourblog.blogspot.com/2026/10/song-name-lyrics-telugu.html
     created = service.posts().insert(
         blogId=blog_id,
         body={"kind": "blogger#post", "title": url_slug_title, "content": raw_html, "labels": labels},
@@ -293,13 +310,15 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
     parsed_url = urllib.parse.urlparse(post_url)
     blog_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
-    # Step 2: Patch the post with the full 'display_title' and inject live self-links
     final_html = raw_html.replace("{{POST_URL}}", post_url).replace("{{BLOG_ORIGIN}}", blog_origin)
     service.posts().patch(
         blogId=blog_id,
         postId=post_id,
         body={"title": display_title, "content": final_html}
     ).execute()
+
+    # Automatically trigger Search Engine crawling ping
+    notify_search_engines(post_url)
 
     return post_id, post_url
 
@@ -327,7 +346,6 @@ if __name__ == "__main__":
 
                 html_template = build_template_html(scraped, seo_data)
 
-                # Clean SEO URL Slug vs Full High-CTR Display Title
                 url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
                 display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
 
