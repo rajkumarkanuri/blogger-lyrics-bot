@@ -294,18 +294,18 @@ def send_telegram_notification(song_name: str, movie_name: str, post_url: str, y
         print(" -> Telegram credentials not found. Skipping notification.")
         return
 
-    message = f"🎵 *New Telugu Song Lyrics Published!*\n\n" \
-              f"✨ *{song_name}* - *{movie_name}*\n\n" \
-              f"📖 Read Telugu & English Lyrics, FAQs, and watch the official video here:\n{post_url}"
+    # HTML formatted message (safe from markdown parsing crashes)
+    message = f"🎵 <b>New Telugu Song Lyrics Published!</b>\n\n" \
+              f"✨ <b>{song_name}</b> - <i>{movie_name}</i>\n\n" \
+              f"📖 Read Telugu & English Lyrics, FAQs, and watch the official video here:\n<a href='{post_url}'>Click here to read & watch</a>"
 
-    # Try high-res thumbnail first, fallback to standard hqdefault if needed
     thumb_url = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
 
     payload = {
         "chat_id": chat_id,
         "photo": thumb_url,
         "caption": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
 
     try:
@@ -314,11 +314,10 @@ def send_telegram_notification(song_name: str, movie_name: str, post_url: str, y
             print(" -> Successfully sent Telegram notification!")
         else:
             print(f" -> Telegram photo error ({resp.text}), sending text-only fallback...")
-            # Fallback to text message if photo fails
             text_payload = {
                 "chat_id": chat_id,
                 "text": message,
-                "parse_mode": "Markdown"
+                "parse_mode": "HTML"
             }
             requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=text_payload, timeout=10)
     except Exception as e:
