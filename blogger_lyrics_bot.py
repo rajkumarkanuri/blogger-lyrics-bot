@@ -2,6 +2,7 @@ import os
 import re
 import json
 import urllib.parse
+import time
 from datetime import datetime
 import requests
 import feedparser
@@ -346,13 +347,12 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
         body={"title": display_title, "content": final_html}
     ).execute()
 
-    # Automatically trigger Search Engine crawling ping
     notify_search_engines(post_url)
-
     return post_id, post_url
 
-import time
-
+# =====================================================================
+# 9. CONTINUOUS WORKER LOOP FOR RAILWAY (RUNS 24/7)
+# =====================================================================
 if __name__ == "__main__":
     while True:
         history_file = "posted_links.txt"
@@ -382,10 +382,14 @@ if __name__ == "__main__":
                     url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
                     display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
 
-                post_id, post_url = publish_to_blogspot(
-                    BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
-                )
-                print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
+                    post_id, post_url = publish_to_blogspot(
+                        BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
+                    )
+                    print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
+
+                    # Trigger Telegram Broadcast Notification
+                    thumb_url = f"https://img.youtube.com/vi/{scraped['youtube_id']}/maxresdefault.jpg"
+                    send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, thumb_url)
 
                     with open(history_file, "a", encoding="utf-8") as f:
                         f.write(entry.link + "\n")
