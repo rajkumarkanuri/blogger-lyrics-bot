@@ -1,0 +1,1 @@
+worker: python blogger_lyrics_bot.py

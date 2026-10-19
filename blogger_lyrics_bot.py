@@ -351,44 +351,52 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
 
     return post_id, post_url
 
+import time
+
 if __name__ == "__main__":
-    history_file = "posted_links.txt"
-    posted_links = set(open(history_file).read().splitlines()) if os.path.exists(history_file) else set()
+    while True:
+        history_file = "posted_links.txt"
+        posted_links = set(open(history_file).read().splitlines()) if os.path.exists(history_file) else set()
 
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        new_song_found = False
 
-    for feed_url in SOURCE_FEEDS:
-        print(f"Checking feed: {feed_url} ...")
-        try:
-            resp = requests.get(feed_url, headers=headers, timeout=15)
-            feed = feedparser.parse(resp.content)
-            print(f" -> Found {len(feed.entries)} songs in this feed.")
-        except Exception as e:
-            print(f" -> Error fetching feed: {e}")
-            continue
+        for feed_url in SOURCE_FEEDS:
+            print(f"Checking feed: {feed_url} ...")
+            try:
+                resp = requests.get(feed_url, headers=headers, timeout=15)
+                feed = feedparser.parse(resp.content)
+                print(f" -> Found {len(feed.entries)} songs in this feed.")
+            except Exception as e:
+                print(f" -> Error fetching feed: {e}")
+                continue
 
-        for entry in feed.entries:
-            if entry.link not in posted_links:
-                print(f"Found new song post: {entry.title}")
-                scraped = extract_lyrics_and_video(entry)
-                seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
+            for entry in feed.entries:
+                if entry.link not in posted_links:
+                    print(f"Found new song post: {entry.title}")
+                    scraped = extract_lyrics_and_video(entry)
+                    seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
 
-                html_template = build_template_html(scraped, seo_data)
+                    html_template = build_template_html(scraped, seo_data)
 
-                url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
-                display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
+                    url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
+                    display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
 
                 post_id, post_url = publish_to_blogspot(
                     BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
                 )
                 print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
 
-                # Trigger Telegram Broadcast Notification
-                thumb_url = f"https://img.youtube.com/vi/{scraped['youtube_id']}/maxresdefault.jpg"
-                send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, thumb_url)
+                    with open(history_file, "a", encoding="utf-8") as f:
+                        f.write(entry.link + "\n")
+                    
+                    new_song_found = True
+                    break
+            if new_song_found:
+                break
 
-                with open(history_file, "a", encoding="utf-8") as f:
-                    f.write(entry.link + "\n")
-                exit(0)
+        if not new_song_found:
+            print("No new unposted songs found in the feeds.")
 
-    print("No new unposted songs found in the feeds.")
+        print("Waiting 12 hours before next feed check...")
+        time.sleep(43200)  # Sleeps for 12 hours (43200 seconds)
