@@ -192,10 +192,8 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
             }
         })
 
-    # ISO 8601 upload date required for Google VideoObject schema
     current_upload_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Build Google Rich Results JSON-LD Schema (FAQPage + VideoObject)
     json_ld_data = {
         "@context": "https://schema.org",
         "@graph": [
@@ -285,7 +283,38 @@ def notify_search_engines(post_url: str):
         print(f" -> Sitemap ping warning: {e}")
 
 # =====================================================================
-# 7. TWO-STEP SEO PUBLISH & INDEX TRIGGER
+# 7. TELEGRAM AUTO-BROADCASTER
+# =====================================================================
+def send_telegram_notification(song_name: str, movie_name: str, post_url: str, thumb_url: str):
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        print(" -> Telegram credentials not found. Skipping notification.")
+        return
+
+    message = f"🎵 *New Telugu Song Lyrics Published!*\n\n" \
+              f"✨ *{song_name}* - *{movie_name}*\n\n" \
+              f"📖 Read Telugu & English Lyrics, FAQs, and watch the official video here:\n{post_url}"
+
+    payload = {
+        "chat_id": chat_id,
+        "photo": thumb_url,
+        "caption": message,
+        "parse_mode": "Markdown"
+    }
+
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendPhoto", json=payload, timeout=10)
+        if resp.status_code == 200:
+            print(" -> Successfully sent Telegram notification!")
+        else:
+            print(f" -> Telegram error: {resp.text}")
+    except Exception as e:
+        print(f" -> Telegram warning: {e}")
+
+# =====================================================================
+# 8. TWO-STEP SEO PUBLISH & INDEX TRIGGER
 # =====================================================================
 def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, raw_html: str, labels: list[str]):
     if os.path.exists("token.json"):
@@ -353,6 +382,10 @@ if __name__ == "__main__":
                     BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
                 )
                 print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
+
+                # Trigger Telegram Broadcast Notification
+                thumb_url = f"https://img.youtube.com/vi/{scraped['youtube_id']}/maxresdefault.jpg"
+                send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, thumb_url)
 
                 with open(history_file, "a", encoding="utf-8") as f:
                     f.write(entry.link + "\n")
