@@ -15,9 +15,9 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 # =====================================================================
-# 1. PUT YOUR KEYS & CORRECT BLOG ID RIGHT HERE:
+# 1. CONFIGURATION & KEYS
 # =====================================================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6JGn9CFHDuIhLbjvdqR8_rs68Fv9XocaP7UnHKyR_oHEg")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BLOG_ID = "2717892436749933785"
 
 SOURCE_FEEDS = [
@@ -48,7 +48,7 @@ class SongPostData(BaseModel):
     labels: list[str]
 
 # =====================================================================
-# 3. SCRAPE TELUGU & ENGLISH LYRICS + YOUTUBE VIDEO ID
+# 3. SCRAPE LYRICS & YOUTUBE VIDEO ID
 # =====================================================================
 def extract_lyrics_and_video(entry) -> dict:
     raw_html = ""
@@ -99,37 +99,30 @@ def extract_lyrics_and_video(entry) -> dict:
 
     return {
         "title": entry.title,
-        "plain_text": soup.get_text(separator="\n", strip=True)[:6000],
+        # Truncate plain text sharply to save AI input tokens (max 1200 chars is plenty for credits)
+        "plain_text": soup.get_text(separator="\n", strip=True)[:1200],
         "youtube_id": yt_id,
         "telugu_html": "<p><br /></p>".join(telugu_blocks),
         "english_html": "<p><br /></p>".join(english_blocks)
     }
 
 # =====================================================================
-# 4. GEMINI SINGLE-CALL FOR SEO METADATA, ABOUT SECTION & FAQs
+# 4. TOKEN-EFFICIENT GEMINI SEO GENERATION
 # =====================================================================
 def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     client = genai.Client(api_key=GEMINI_API_KEY)
 
+    # Short, compact prompt to drastically lower token consumption
     prompt = f"""
-    Extract the song credits from the scraped page text below and generate SEO-optimized structured JSON for a Telugu lyrics blog post.
+    Extract song credits and generate structured JSON for: {title}
+    Text snippet: {plain_text}
     
-    Song Title: {title}
-    Scraped Page Text:
-    {plain_text[:3000]}
-
-    Instructions:
-    1. Identify exact 'song_name', 'movie_name', 'singer', 'composer', 'music', 'lyricist', 'actors', 'director', and 'label'. (Use 'TBA' only if completely unknown).
-    2. 'seo_meta_description': Write a 145-155 character SEO meta description starting with "{title.split()[0]} Song Lyrics in Telugu and English from..." that naturally includes the movie name, singer, composer, and lyricist.
-    3. 'about_paragraphs': Write 3 to 4 original, keyword-rich paragraphs discussing the song's musical vibe, movie context, composer's style, and vocal performances. Naturally include search phrases like "[Song Name] lyrics in Telugu", "[Song Name] English meaning/transliteration", and "[Movie Name] songs".
-    4. 'faqs': Write 6 high-search-intent FAQs covering:
-       - Who sang the song [Song Name] from [Movie Name]?
-       - Who wrote the lyrics for [Song Name]?
-       - Who is the music director/composer of [Song Name]?
-       - Which actors are featured in the [Song Name] lyrical video?
-       - Who directed the movie [Movie Name]?
-       - Which music label released [Song Name]?
-    5. 'labels': Provide 4 short Blogger category labels (each under 20 characters, e.g., Movie Name, Composer, 'Telugu Lyrics').
+    Requirements:
+    - Identify exact 'song_name', 'movie_name', 'singer', 'composer', 'music', 'lyricist', 'actors', 'director', 'label'.
+    - 'seo_meta_description': 140-155 characters SEO description for "{title}".
+    - 'about_paragraphs': Exactly 2 concise paragraphs discussing the song and movie context.
+    - 'faqs': 3 concise high-intent FAQs (who sang, who wrote lyrics, who composed).
+    - 'labels': 3 short category labels.
     """
 
     final_res = client.models.generate_content(
@@ -143,7 +136,32 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     return SongPostData.model_validate_json(final_res.text)
 
 # =====================================================================
-# 5. AUTO-FIND YOUTUBE ID + BUILD SEO HTML & JSON-LD SCHEMA
+# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES
+# =====================================================================
+def get_existing_blog_titles() -> set:
+    try:
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json")
+        else:
+            creds = Credentials.from_authorized_user_info(json.loads(os.environ["BLOGGER_TOKEN_JSON"]))
+
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+
+        service = build("blogger", "v3", credentials=creds)
+        posts = service.posts().list(blogId=BLOG_ID, maxResults=50).execute()
+        
+        existing_titles = set()
+        if "items" in posts:
+            for item in posts["items"]:
+                existing_titles.add(item["title"].lower().strip())
+        return existing_titles
+    except Exception as e:
+        print(f" -> Warning fetching existing blog posts: {e}")
+        return set()
+
+# =====================================================================
+# 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
 def find_youtube_video_id(query: str) -> str:
     try:
@@ -163,51 +181,38 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
     m_name = data.movie_name
 
     yt_id = scraped["youtube_id"]
-    if not yt_id or yt_id == "L8s6qxQJKgk":
+    if not yt_id:
         search_query = f"{s_name} {m_name} Telugu lyrical song"
-        print(f" -> Searching YouTube for: {search_query} ...")
         yt_id = find_youtube_video_id(search_query)
-        print(f" -> Found YouTube ID: {yt_id}")
 
-    thumb_url = f"https://img.youtube.com/vi/{yt_id}/maxresdefault.jpg"
-    linked_song = f'<a href="{{{{POST_URL}}}}" title="{s_name} Lyrics in Telugu and English">{s_name}</a>'
+    thumb_url = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
+    linked_song = f'<a href="{{{{POST_URL}}}}" title="{s_name} Lyrics">{s_name}</a>'
 
     pattern = re.compile(re.escape(s_name), re.IGNORECASE)
     english_html = pattern.sub(linked_song, scraped["english_html"], count=3)
     telugu_html = scraped["telugu_html"]
-
     about_html = "".join([f"<p>{p}</p>" for p in data.about_paragraphs])
 
     faq_html = ""
     faq_schema_list = []
     for faq in data.faqs:
-        q_linked = pattern.sub(linked_song, faq.question)
-        a_linked = pattern.sub(linked_song, faq.answer)
-        faq_html += f"<p><strong>{q_linked}</strong></p><p>{a_linked}</p><p><strong><br /></strong></p>"
+        faq_html += f"<p><strong>{faq.question}</strong></p><p>{faq.answer}</p><p><br /></p>"
         faq_schema_list.append({
             "@type": "Question",
             "name": faq.question,
-            "acceptedAnswer": {
-                "@type": "Answer",
-                "text": faq.answer
-            }
+            "acceptedAnswer": {"@type": "Answer", "text": faq.answer}
         })
-
-    current_upload_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     json_ld_data = {
         "@context": "https://schema.org",
         "@graph": [
-            {
-                "@type": "FAQPage",
-                "mainEntity": faq_schema_list
-            },
+            {"@type": "FAQPage", "mainEntity": faq_schema_list},
             {
                 "@type": "VideoObject",
                 "name": f"{s_name} Lyrical Video - {m_name}",
                 "description": data.seo_meta_description,
                 "thumbnailUrl": [thumb_url],
-                "uploadDate": current_upload_date,
+                "uploadDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "embedUrl": f"https://www.youtube.com/embed/{yt_id}"
             }
         ]
@@ -220,112 +225,66 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 <p><em>{data.seo_meta_description}</em></p>
 <h2 itemprop="name"><a href="{{{{POST_URL}}}}">{s_name} Lyrics - {m_name} (Telugu &amp; English)</a></h2>
 <hr />
-<img alt="{s_name} Song Lyrics in Telugu and English - {m_name}" title="{s_name} Lyrical - {m_name}" itemprop="image" loading="lazy" src="{thumb_url}" width="100%" />
+<img alt="{s_name} Song Lyrics" itemprop="image" loading="lazy" src="{thumb_url}" width="100%" />
 <hr />
-<style>
-    table{{
-        border-spacing: 0px;
-        border: solid 1px black;
-        padding:10px;
-        width:100%;
-    }}
-    tr,td{{
-        border-spacing: 0px;
-        border: solid 1px black;
-        padding:10px;
-    }}
-</style>
 <h3>{s_name} Song Credits &amp; Movie Details</h3>
-<table>
+<table border="1" style="width:100%; border-collapse:collapse; padding:10px;">
 <tbody>
 <tr><td><strong>Song Name</strong></td><td><b>{s_name}</b></td></tr>
 <tr><td><strong>Movie / Album</strong></td><td><b>{m_name}</b></td></tr>
 <tr><td><strong>Singer</strong></td><td>{data.singer}</td></tr>
-<tr><td><strong>Composer</strong></td><td itemprop="composer" itemscope="" itemtype="http://schema.org/Person"><b itemprop="name">{data.composer}</b></td></tr>
-<tr><td><strong>Music</strong></td><td><b>{data.music}</b></td></tr>
-<tr><td><strong>Song Writer (Lyricist)</strong></td><td itemprop="lyricist" itemscope="" itemtype="http://schema.org/Person"><b itemprop="name">{data.lyricist}</b></td></tr>
+<tr><td><strong>Composer</strong></td><td><b>{data.composer}</b></td></tr>
+<tr><td><strong>Lyricist</strong></td><td><b>{data.lyricist}</b></td></tr>
 <tr><td><strong>Star Cast</strong></td><td>{data.actors}</td></tr>
 <tr><td><strong>Director</strong></td><td>{data.director}</td></tr>
 <tr><td><strong>Music Label</strong></td><td>{data.label}</td></tr>
 </tbody></table>
 <hr />
-<div itemprop="lyrics" itemscope="" itemtype="http://schema.org/CreativeWork" style="text-align: center;">
-<p><strong>About {linked_song} Song:</strong></p><p><br /></p>
+<div itemprop="lyrics" style="text-align: center;">
+<p><strong>About {linked_song} Song:</strong></p>
 {about_html}
-<p><b><br /></b></p>
-<h2 id="telugu-lyrics"><b><a href="{{{{POST_URL}}}}">{s_name} Song Lyrics in Telugu Script:</a></b></h2><p><br /></p>
-<div itemprop="text">
+<h2><b><a href="{{{{POST_URL}}}}">{s_name} Telugu Lyrics:</a></b></h2>
 {telugu_html}
-<p><br /></p><p><br /></p>
-<h2 id="english-lyrics"><b><a href="{{{{POST_URL}}}}">{s_name} Song Lyrics in English (Transliteration):</a></b></h2>
+<h2><b><a href="{{{{POST_URL}}}}">{s_name} English Lyrics:</a></b></h2>
 {english_html}
-</div>
-<p>&nbsp;</p><p><strong><br /></strong></p>
-<h2 id="song-faqs"><strong>{linked_song}&nbsp;Song FAQs</strong></h2><p><strong><br /></strong></p>
+<h2><strong>{s_name} FAQs</strong></h2>
 {faq_html}
 </div>
-<br />
-<h2>{s_name} Lyrical - {m_name} Official Video</h2>
-<iframe frameborder="0" height="360" loading="lazy" marginheight="0" marginwidth="0" scrolling="no" src="https://www.youtube.com/embed/{yt_id}?autoplay=0&amp;origin={{{{BLOG_ORIGIN}}}}" title="{s_name} YouTube Lyrical Video" type="text/html" width="100%"></iframe>
+<iframe frameborder="0" height="360" src="https://www.youtube.com/embed/{yt_id}" width="100%"></iframe>
 </div>"""
 
 # =====================================================================
-# 6. AUTO-PING GOOGLE & BING SITEMAPS UPON PUBLISH
+# 7. NOTIFICATIONS & PUBLISHING
 # =====================================================================
 def notify_search_engines(post_url: str):
     try:
         parsed = urllib.parse.urlparse(post_url)
         sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
-        
         requests.get(f"https://www.google.com/ping?sitemap={urllib.parse.quote(sitemap_url)}", timeout=5)
         requests.get(f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url)}", timeout=5)
-        print(" -> Successfully notified Google and Bing to crawl the sitemap!")
-    except Exception as e:
-        print(f" -> Sitemap ping warning: {e}")
+    except Exception:
+        pass
 
-# =====================================================================
-# 7. TELEGRAM AUTO-BROADCASTER
-# =====================================================================
 def send_telegram_notification(song_name: str, movie_name: str, post_url: str, yt_id: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
     if not bot_token or not chat_id:
-        print(" -> Telegram credentials not found. Skipping notification.")
         return
 
-    # HTML formatted message (safe from markdown parsing crashes)
     message = f"🎵 <b>New Telugu Song Lyrics Published!</b>\n\n" \
               f"✨ <b>{song_name}</b> - <i>{movie_name}</i>\n\n" \
-              f"📖 Read Telugu & English Lyrics, FAQs, and watch the official video here:\n<a href='{post_url}'>Click here to read & watch</a>"
+              f"📖 Read & Watch here:\n<a href='{post_url}'>Click here to view lyrics</a>"
 
     thumb_url = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
-
-    payload = {
-        "chat_id": chat_id,
-        "photo": thumb_url,
-        "caption": message,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": chat_id, "photo": thumb_url, "caption": message, "parse_mode": "HTML"}
 
     try:
         resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendPhoto", json=payload, timeout=10)
-        if resp.status_code == 200:
-            print(" -> Successfully sent Telegram notification!")
-        else:
-            print(f" -> Telegram photo error ({resp.text}), sending text-only fallback...")
-            text_payload = {
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML"
-            }
-            requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=text_payload, timeout=10)
-    except Exception as e:
-        print(f" -> Telegram warning: {e}")
+        if resp.status_code != 200:
+            requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
+    except Exception:
+        pass
 
-# =====================================================================
-# 8. TWO-STEP SEO PUBLISH & INDEX TRIGGER
-# =====================================================================
 def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, raw_html: str, labels: list[str]):
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json")
@@ -336,7 +295,6 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
         creds.refresh(Request())
 
     service = build("blogger", "v3", credentials=creds)
-
     created = service.posts().insert(
         blogId=blog_id,
         body={"kind": "blogger#post", "title": url_slug_title, "content": raw_html, "labels": labels},
@@ -345,7 +303,6 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
 
     post_id = created["id"]
     post_url = created["url"]
-
     parsed_url = urllib.parse.urlparse(post_url)
     blog_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
@@ -360,12 +317,13 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
     return post_id, post_url
 
 # =====================================================================
-# 9. CONTINUOUS WORKER LOOP FOR RAILWAY (RUNS 24/7)
+# 8. CONTINUOUS WORKER LOOP
 # =====================================================================
 if __name__ == "__main__":
     while True:
-        history_file = "posted_links.txt"
-        posted_links = set(open(history_file).read().splitlines()) if os.path.exists(history_file) else set()
+        print("Fetching existing blog posts to prevent duplicates...")
+        existing_blog_titles = get_existing_blog_titles()
+        print(f" -> Found {len(existing_blog_titles)} existing posts on Blogger.")
 
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
         new_song_found = False
@@ -375,41 +333,43 @@ if __name__ == "__main__":
             try:
                 resp = requests.get(feed_url, headers=headers, timeout=15)
                 feed = feedparser.parse(resp.content)
-                print(f" -> Found {len(feed.entries)} songs in this feed.")
             except Exception as e:
                 print(f" -> Error fetching feed: {e}")
                 continue
 
             for entry in feed.entries:
-                if entry.link not in posted_links:
-                    print(f"Found new song post: {entry.title}")
-                    scraped = extract_lyrics_and_video(entry)
-                    seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
+                clean_title = entry.title.lower().strip()
+                
+                # Check duplicate against live Blogger posts
+                if clean_title in existing_blog_titles:
+                    print(f" -> Skipping duplicate: {entry.title}")
+                    continue
 
-                    html_template = build_template_html(scraped, seo_data)
+                print(f"Found new unique song post: {entry.title}")
+                scraped = extract_lyrics_and_video(entry)
+                
+                # Generates token-efficient SEO content
+                seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
 
-                    url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
-                    display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
+                html_template = build_template_html(scraped, seo_data)
+                url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
+                display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
 
-                    post_id, post_url = publish_to_blogspot(
-                        BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
-                    )
-                    print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
+                post_id, post_url = publish_to_blogspot(
+                    BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
+                )
+                print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
 
-                    # Trigger Telegram Broadcast Notification
-                    thumb_url = f"https://img.youtube.com/vi/{scraped['youtube_id']}/maxresdefault.jpg"
-                    send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, thumb_url)
+                send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, scraped['youtube_id'])
 
-                    with open(history_file, "a", encoding="utf-8") as f:
-                        f.write(entry.link + "\n")
-                    
-                    new_song_found = True
-                    break
+                # Add a safe delay to respect rate limits
+                print(" -> Pausing 10 seconds before next action...")
+                time.sleep(10)
+
+                new_song_found = True
+                break
             if new_song_found:
                 break
 
-        if not new_song_found:
-            print("No new unposted songs found in the feeds.")
-
         print("Waiting 12 hours before next feed check...")
-        time.sleep(43200)  # Sleeps for 12 hours (43200 seconds)
+        time.sleep(43200)
