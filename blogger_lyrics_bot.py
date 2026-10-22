@@ -20,10 +20,8 @@ from googleapiclient.discovery import build
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BLOG_ID = "2717892436749933785"
 
-SOURCE_FEEDS = [
-    "https://www.telugulyricsworld.in/feeds/posts/default?alt=rss",
-    "https://telugulyricspage.blogspot.com/feeds/posts/default?alt=rss",
-]
+# Primary high-authority feed source for new Telugu releases
+MASTER_FEED = "https://www.telugulyricsworld.in/feeds/posts/default?alt=rss"
 
 # =====================================================================
 # 2. STRUCTURED SEO SCHEMA FOR GEMINI
@@ -99,7 +97,7 @@ def extract_lyrics_and_video(entry) -> dict:
 
     return {
         "title": entry.title,
-        # Truncate plain text sharply to save AI input tokens (max 1200 chars is plenty for credits)
+        # Truncate plain text sharply to save AI input tokens
         "plain_text": soup.get_text(separator="\n", strip=True)[:1200],
         "youtube_id": yt_id,
         "telugu_html": "<p><br /></p>".join(telugu_blocks),
@@ -111,8 +109,6 @@ def extract_lyrics_and_video(entry) -> dict:
 # =====================================================================
 def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     client = genai.Client(api_key=GEMINI_API_KEY)
-
-    # Short, compact prompt to drastically lower token consumption
     prompt = f"""
     Extract song credits and generate structured JSON for: {title}
     Text snippet: {plain_text}
@@ -136,7 +132,7 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     return SongPostData.model_validate_json(final_res.text)
 
 # =====================================================================
-# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES
+# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (LIVE API CHECK)
 # =====================================================================
 def get_existing_blog_titles() -> set:
     try:
@@ -149,7 +145,7 @@ def get_existing_blog_titles() -> set:
             creds.refresh(Request())
 
         service = build("blogger", "v3", credentials=creds)
-        posts = service.posts().list(blogId=BLOG_ID, maxResults=50).execute()
+        posts = service.posts().list(blogId=BLOG_ID, maxResults=100).execute()
         
         existing_titles = set()
         if "items" in posts:
@@ -317,38 +313,38 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
     return post_id, post_url
 
 # =====================================================================
-# 8. CONTINUOUS WORKER LOOP
+# 8. CONTINUOUS HOURLY CHECKER WORKER LOOP
 # =====================================================================
 if __name__ == "__main__":
     while True:
-        print("Fetching existing blog posts to prevent duplicates...")
+        print("Checking live Blogger API for existing posts...")
         existing_blog_titles = get_existing_blog_titles()
-        print(f" -> Found {len(existing_blog_titles)} existing posts on Blogger.")
+        print(f" -> Found {len(existing_blog_titles)} existing posts live on Blogger.")
 
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        new_song_found = False
+        
+        print(f"Checking master feed for new releases: {MASTER_FEED} ...")
+        try:
+            resp = requests.get(MASTER_FEED, headers=headers, timeout=15)
+            feed = feedparser.parse(resp.content)
+            print(f" -> Found {len(feed.entries)} total entries in feed.")
+        except Exception as e:
+            print(f" -> Error fetching feed: {e}")
+            feed = None
 
-        for feed_url in SOURCE_FEEDS:
-            print(f"Checking feed: {feed_url} ...")
-            try:
-                resp = requests.get(feed_url, headers=headers, timeout=15)
-                feed = feedparser.parse(resp.content)
-            except Exception as e:
-                print(f" -> Error fetching feed: {e}")
-                continue
-
+        if feed:
+            new_song_published = False
             for entry in feed.entries:
                 clean_title = entry.title.lower().strip()
                 
-                # Check duplicate against live Blogger posts
+                # Strict check against your live blog posts (Zero duplicates)
                 if clean_title in existing_blog_titles:
-                    print(f" -> Skipping duplicate: {entry.title}")
-                    continue
+                    continue  # Skip already posted songs quietly
 
-                print(f"Found new unique song post: {entry.title}")
+                print(f"Found brand new trending release: {entry.title}")
                 scraped = extract_lyrics_and_video(entry)
                 
-                # Generates token-efficient SEO content
+                # Generate token-efficient SEO content
                 seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
 
                 html_template = build_template_html(scraped, seo_data)
@@ -358,18 +354,15 @@ if __name__ == "__main__":
                 post_id, post_url = publish_to_blogspot(
                     BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
                 )
-                print(f"Published SEO Post! Post ID: {post_id} | Live URL: {post_url}")
+                print(f"Published Trending Song! Post ID: {post_id} | Live URL: {post_url}")
 
                 send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, scraped['youtube_id'])
 
-                # Add a safe delay to respect rate limits
-                print(" -> Pausing 10 seconds before next action...")
-                time.sleep(10)
+                new_song_published = True
+                break  # Publish one trending song per hourly check
 
-                new_song_found = True
-                break
-            if new_song_found:
-                break
+            if not new_song_published:
+                print("No new trending songs found in this hourly check.")
 
-        print("Waiting 12 hours before next feed check...")
-        time.sleep(43200)
+        print("Waiting 1 hour before next release check...")
+        time.sleep(3600)  # Checks every 1 hour (3600 seconds)
