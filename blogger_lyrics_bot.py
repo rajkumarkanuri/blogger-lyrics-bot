@@ -130,7 +130,7 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     for attempt in range(max_retries):
         try:
             final_res = client.models.generate_content(
-                model="gemini-3.8-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -146,7 +146,7 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
                 raise e
 
 # =====================================================================
-# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (LIVE API CHECK)
+# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (FULL PAGINATION CHECK)
 # =====================================================================
 def get_existing_blog_titles() -> set:
     try:
@@ -163,21 +163,29 @@ def get_existing_blog_titles() -> set:
         existing_titles = set()
         page_token = None
         
-        # Loop through pages to fetch up to 500 existing blog posts to guarantee zero duplicates
-        for _ in range(5):
-            posts = service.posts().list(blogId=BLOG_ID, maxResults=100, pageToken=page_token).execute()
-            if "items" in posts:
-                for item in posts["items"]:
+        # Continuously paginate through all available pages until every post is fetched
+        while True:
+            response = service.posts().list(
+                blogId=BLOG_ID, 
+                maxResults=100, 
+                pageToken=page_token
+            ).execute()
+            
+            if "items" in response:
+                for item in response["items"]:
                     existing_titles.add(item["title"].lower().strip())
             
-            page_token = posts.get("nextPageToken")
+            # Check if there is another page of posts
+            page_token = response.get("nextPageToken")
             if not page_token:
                 break
                 
+        print(f" -> Successfully fetched all {len(existing_titles)} live posts from Blogger API.")
         return existing_titles
     except Exception as e:
         print(f" -> Warning fetching existing blog posts: {e}")
         return set()
+
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
@@ -272,7 +280,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 </div>"""
 
 # =====================================================================
-# 7. SEARCH ENGINES, INDEXING API & TELEGRAM NOTIFICATIONS
+# 7. SEARCH ENGINES, AUTOMATED INDEXING API & TELEGRAM NOTIFICATIONS
 # =====================================================================
 def notify_search_engines(post_url: str):
     try:
@@ -284,9 +292,8 @@ def notify_search_engines(post_url: str):
         pass
 
 def notify_google_indexing_api(post_url: str):
-    """Directly pushes the URL to Google's Indexing API using a Service Account."""
+    """Actively pushes the newly published URL to Google's live Indexing API queue."""
     try:
-        # Load service account credentials specifically for the Indexing scope
         if os.path.exists("service_account.json"):
             creds = service_account.Credentials.from_service_account_file(
                 "service_account.json", 
@@ -299,10 +306,10 @@ def notify_google_indexing_api(post_url: str):
                 scopes=["https://www.googleapis.com/auth/indexing"]
             )
         else:
-            print(" -> Indexing API skipped: No service_account.json found.")
+            print(" -> Indexing API skipped: No service_account.json found in environment.")
             return
 
-        auth_req = google.auth.transport.requests.Request()
+        auth_req = Request()
         creds.refresh(auth_req)
 
         endpoint = "https://indexing.googleapis.com/v3/urlNotifications:publish"
@@ -317,7 +324,7 @@ def notify_google_indexing_api(post_url: str):
 
         response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
         if response.status_code == 200:
-            print(" -> Successfully pushed URL to Google Indexing API!")
+            print(" -> SUCCESS: Page automatically submitted to Google Indexing API!")
         else:
             print(f" -> Indexing API response: {response.text}")
     except Exception as e:
@@ -371,6 +378,7 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
         body={"title": display_title, "content": final_html}
     ).execute()
 
+    # Notify search engines & actively push to Google Indexing API
     notify_search_engines(post_url)
     notify_google_indexing_api(post_url)
     return post_id, post_url
@@ -380,7 +388,7 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
 # =====================================================================
 if __name__ == "__main__":
     while True:
-        print("Checking live Blogger API for existing posts...")
+        print("Checking live Blogger API for existing posts (deep history check)...")
         existing_blog_titles = get_existing_blog_titles()
         print(f" -> Found {len(existing_blog_titles)} existing posts live on Blogger.")
 
@@ -388,6 +396,9 @@ if __name__ == "__main__":
         new_song_published = False
 
         for feed_url in SOURCE_FEEDS:
+            if new_song_published:
+                break
+                
             print(f"Scanning source feed: {feed_url} ...")
             try:
                 resp = requests.get(feed_url, headers=headers, timeout=15)
@@ -399,18 +410,16 @@ if __name__ == "__main__":
             for entry in feed.entries:
                 clean_title = entry.title.lower().strip()
                 
-                # Strict live check prevents duplicates across multiple sources
                 if clean_title in existing_blog_titles:
                     continue
 
-                print(f"Found unique trending release: {entry.title}")
+                print(f"Found next unposted trending release: {entry.title}")
                 scraped = extract_lyrics_and_video(entry)
                 
-                # Token-efficient AI SEO generation
                 try:
                     seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
                 except Exception as ai_err:
-                    print(f" -> Skipping song due to persistent AI error: {ai_err}")
+                    print(f" -> Skipping song due to AI error, trying next entry: {ai_err}")
                     continue
 
                 html_template = build_template_html(scraped, seo_data)
@@ -420,18 +429,15 @@ if __name__ == "__main__":
                 post_id, post_url = publish_to_blogspot(
                     BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
                 )
-                print(f"Published Trending Song! Post ID: {post_id} | Live URL: {post_url}")
+                print(f"Published Unique Song! Post ID: {post_id} | Live URL: {post_url}")
 
                 send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, scraped['youtube_id'])
 
                 new_song_published = True
-                break  # Process one new unique song per cycle
-
-            if new_song_published:
-                break
+                break  
 
         if not new_song_published:
             print("No new unique songs found across feeds in this hourly check.")
 
         print("Waiting 1 hour before next multi-source release check...")
-        time.sleep(3600)  # Runs every hour
+        time.sleep(3600)
