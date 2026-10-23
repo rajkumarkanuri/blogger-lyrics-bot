@@ -146,7 +146,7 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
                 raise e
 
 # =====================================================================
-# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (FULL PAGINATION CHECK)
+# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (FORCED FULL SYNC)
 # =====================================================================
 def get_existing_blog_titles() -> set:
     try:
@@ -163,29 +163,29 @@ def get_existing_blog_titles() -> set:
         existing_titles = set()
         page_token = None
         
-        # Continuously paginate through all available pages until every post is fetched
+        # Explicitly request sorted posts by publication date with full pagination
         while True:
             response = service.posts().list(
                 blogId=BLOG_ID, 
                 maxResults=100, 
+                orderBy="published",
                 pageToken=page_token
             ).execute()
             
             if "items" in response:
                 for item in response["items"]:
-                    existing_titles.add(item["title"].lower().strip())
+                    if "title" in item:
+                        existing_titles.add(item["title"].lower().strip())
             
-            # Check if there is another page of posts
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
                 
-        print(f" -> Successfully fetched all {len(existing_titles)} live posts from Blogger API.")
+        print(f" -> Successfully synchronized {len(existing_titles)} total titles from Blogger API.")
         return existing_titles
     except Exception as e:
         print(f" -> Warning fetching existing blog posts: {e}")
         return set()
-
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
