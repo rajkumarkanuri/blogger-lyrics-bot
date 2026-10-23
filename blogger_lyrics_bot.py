@@ -159,17 +159,25 @@ def get_existing_blog_titles() -> set:
             creds.refresh(Request())
 
         service = build("blogger", "v3", credentials=creds)
-        posts = service.posts().list(blogId=BLOG_ID, maxResults=100).execute()
         
         existing_titles = set()
-        if "items" in posts:
-            for item in posts["items"]:
-                existing_titles.add(item["title"].lower().strip())
+        page_token = None
+        
+        # Loop through pages to fetch up to 500 existing blog posts to guarantee zero duplicates
+        for _ in range(5):
+            posts = service.posts().list(blogId=BLOG_ID, maxResults=100, pageToken=page_token).execute()
+            if "items" in posts:
+                for item in posts["items"]:
+                    existing_titles.add(item["title"].lower().strip())
+            
+            page_token = posts.get("nextPageToken")
+            if not page_token:
+                break
+                
         return existing_titles
     except Exception as e:
         print(f" -> Warning fetching existing blog posts: {e}")
         return set()
-
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
