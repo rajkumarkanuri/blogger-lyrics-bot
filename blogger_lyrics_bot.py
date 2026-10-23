@@ -3,7 +3,7 @@ import re
 import json
 import urllib.parse
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 import feedparser
 from bs4 import BeautifulSoup
@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
@@ -109,7 +110,7 @@ def extract_lyrics_and_video(entry) -> dict:
     }
 
 # =====================================================================
-# 4. TOKEN-EFFICIENT GEMINI SEO GENERATION
+# 4. TOKEN-EFFICIENT GEMINI SEO GENERATION (WITH AUTO-RETRY)
 # =====================================================================
 def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -125,15 +126,24 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     - 'labels': 3 short category labels.
     """
 
-    final_res = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=SongPostData,
-        )
-    )
-    return SongPostData.model_validate_json(final_res.text)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            final_res = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=SongPostData,
+                )
+            )
+            return SongPostData.model_validate_json(final_res.text)
+        except Exception as e:
+            print(f" -> Gemini API temporary error (Attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+            else:
+                raise e
 
 # =====================================================================
 # 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (LIVE API CHECK)
@@ -212,7 +222,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
                 "name": f"{s_name} Lyrical Video - {m_name}",
                 "description": data.seo_meta_description,
                 "thumbnailUrl": [thumb_url],
-                "uploadDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "uploadDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "embedUrl": f"https://www.youtube.com/embed/{yt_id}"
             }
         ]
@@ -266,29 +276,40 @@ def notify_search_engines(post_url: str):
         pass
 
 def notify_google_indexing_api(post_url: str):
-    """Pushes URL directly to Google Indexing API for immediate crawling."""
+    """Directly pushes the URL to Google's Indexing API using a Service Account."""
     try:
-        if os.path.exists("token.json"):
-            creds = Credentials.from_authorized_user_file("token.json", scopes=["https://www.googleapis.com/auth/indexing"])
-        else:
-            creds = Credentials.from_authorized_user_info(
-                json.loads(os.environ["BLOGGER_TOKEN_JSON"]), 
+        # Load service account credentials specifically for the Indexing scope
+        if os.path.exists("service_account.json"):
+            creds = service_account.Credentials.from_service_account_file(
+                "service_account.json", 
                 scopes=["https://www.googleapis.com/auth/indexing"]
             )
+        elif "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ:
+            creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info, 
+                scopes=["https://www.googleapis.com/auth/indexing"]
+            )
+        else:
+            print(" -> Indexing API skipped: No service_account.json found.")
+            return
 
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        auth_req = google.auth.transport.requests.Request()
+        creds.refresh(auth_req)
 
         endpoint = "https://indexing.googleapis.com/v3/urlNotifications:publish"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {creds.token}"
         }
-        payload = {"url": post_url, "type": "URL_UPDATED"}
+        payload = {
+            "url": post_url,
+            "type": "URL_UPDATED"
+        }
 
         response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
         if response.status_code == 200:
-            print(" -> Successfully notified Google Indexing API!")
+            print(" -> Successfully pushed URL to Google Indexing API!")
         else:
             print(f" -> Indexing API response: {response.text}")
     except Exception as e:
@@ -378,7 +399,11 @@ if __name__ == "__main__":
                 scraped = extract_lyrics_and_video(entry)
                 
                 # Token-efficient AI SEO generation
-                seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
+                try:
+                    seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
+                except Exception as ai_err:
+                    print(f" -> Skipping song due to persistent AI error: {ai_err}")
+                    continue
 
                 html_template = build_template_html(scraped, seo_data)
                 url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
