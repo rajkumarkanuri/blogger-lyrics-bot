@@ -146,57 +146,35 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
                 raise e
 
 # =====================================================================
-# 5. DUAL DUPLICATE PREVENTION: BLOGGER API & LOCAL TEXT LOG
+# 5. PERMANENT LOCAL TEXT LOG DUPLICATE PREVENTION
 # =====================================================================
 def get_existing_blog_titles() -> set:
     existing_titles = set()
     
-    # 1. Load from local text file (posted_songs.txt)
+    # Load from local text file (posted_songs.txt)
     if os.path.exists(POSTED_LOG_FILE):
         try:
             with open(POSTED_LOG_FILE, "r", encoding="utf-8") as f:
                 for line in f:
                     parts = line.strip().split("|")
-                    if parts:
+                    if parts and parts[0]:
                         existing_titles.add(parts[0].lower().strip())
             print(f" -> Loaded {len(existing_titles)} posted songs from local log ({POSTED_LOG_FILE}).")
         except Exception as e:
             print(f" -> Warning reading local log: {e}")
-
-    # 2. Load from Blogger API pagination
-    try:
-        if os.path.exists("token.json"):
-            creds = Credentials.from_authorized_user_file("token.json")
-        else:
-            creds = Credentials.from_authorized_user_info(json.loads(os.environ["BLOGGER_TOKEN_JSON"]))
-
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-
-        service = build("blogger", "v3", credentials=creds)
-        page_token = None
-        
-        while True:
-            # Fixed orderBy to uppercase 'PUBLISHED' as required by Blogger API v3
-            response = service.posts().list(
-                blogId=BLOG_ID, 
-                maxResults=100, 
-                orderBy="PUBLISHED",
-                pageToken=page_token
-            ).execute()
-            
-            if "items" in response:
-                for item in response["items"]:
-                    if "title" in item:
-                        existing_titles.add(item["title"].lower().strip())
-            
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
-    except Exception as e:
-        print(f" -> Warning fetching Blogger API posts: {e}")
+    else:
+        print(f" -> No local log file found yet. A new {POSTED_LOG_FILE} will be created upon publication.")
 
     return existing_titles
+
+def log_posted_song(song_title: str, post_url: str):
+    """Appends the newly published song title and link to the local text file."""
+    try:
+        with open(POSTED_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{song_title.lower().strip()}|{post_url}\n")
+        print(f" -> Logged song to {POSTED_LOG_FILE}")
+    except Exception as e:
+        print(f" -> Error writing to local log: {e}")
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
