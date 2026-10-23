@@ -122,15 +122,15 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     - Identify exact 'song_name', 'movie_name', 'singer', 'composer', 'music', 'lyricist', 'actors', 'director', 'label'.
     - 'seo_meta_description': 140-155 characters SEO description for "{title}".
     - 'about_paragraphs': Exactly 2 concise paragraphs discussing the song and movie context.
-    - 'faqs': 3 concise high-intent FAQs (who sang, who wrote lyrics, who composed).
-    - 'labels': 3 short category labels.
+    - 'faqs': 5 concise high-intent FAQs (who sang, who wrote lyrics, who composed).
+    - 'labels': 7 short category labels.
     """
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
             final_res = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
