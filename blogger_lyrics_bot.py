@@ -20,6 +20,7 @@ from googleapiclient.discovery import build
 # =====================================================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BLOG_ID = "2717892436749933785"
+POSTED_LOG_FILE = "posted_songs.txt"
 
 # Multiple high-authority feeds to capture trending & classic hits quickly
 SOURCE_FEEDS = [
@@ -102,7 +103,6 @@ def extract_lyrics_and_video(entry) -> dict:
 
     return {
         "title": entry.title,
-        # Sharp truncation to drastically lower token usage
         "plain_text": soup.get_text(separator="\n", strip=True)[:1200],
         "youtube_id": yt_id,
         "telugu_html": "<p><br /></p>".join(telugu_blocks),
@@ -130,7 +130,7 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     for attempt in range(max_retries):
         try:
             final_res = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -146,9 +146,24 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
                 raise e
 
 # =====================================================================
-# 5. FETCH RECENT BLOG POSTS TO PREVENT DUPLICATES (FORCED FULL SYNC)
+# 5. DUAL DUPLICATE PREVENTION: BLOGGER API & LOCAL TEXT LOG
 # =====================================================================
 def get_existing_blog_titles() -> set:
+    existing_titles = set()
+    
+    # 1. Load from local text file (posted_songs.txt)
+    if os.path.exists(POSTED_LOG_FILE):
+        try:
+            with open(POSTED_LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split("|")
+                    if parts:
+                        existing_titles.add(parts[0].lower().strip())
+            print(f" -> Loaded {len(existing_titles)} posted songs from local log ({POSTED_LOG_FILE}).")
+        except Exception as e:
+            print(f" -> Warning reading local log: {e}")
+
+    # 2. Load from Blogger API pagination
     try:
         if os.path.exists("token.json"):
             creds = Credentials.from_authorized_user_file("token.json")
@@ -159,11 +174,8 @@ def get_existing_blog_titles() -> set:
             creds.refresh(Request())
 
         service = build("blogger", "v3", credentials=creds)
-        
-        existing_titles = set()
         page_token = None
         
-        # Explicitly request sorted posts by publication date with full pagination
         while True:
             response = service.posts().list(
                 blogId=BLOG_ID, 
@@ -180,12 +192,20 @@ def get_existing_blog_titles() -> set:
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
-                
-        print(f" -> Successfully synchronized {len(existing_titles)} total titles from Blogger API.")
-        return existing_titles
     except Exception as e:
-        print(f" -> Warning fetching existing blog posts: {e}")
-        return set()
+        print(f" -> Warning fetching Blogger API posts: {e}")
+
+    return existing_titles
+
+def log_posted_song(song_title: str, post_url: str):
+    """Appends the newly published song title and link to the local text file."""
+    try:
+        with open(POSTED_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{song_title.lower().strip()}|{post_url}\n")
+        print(f" -> Logged song to {POSTED_LOG_FILE}")
+    except Exception as e:
+        print(f" -> Error writing to local log: {e}")
+
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
@@ -280,7 +300,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 </div>"""
 
 # =====================================================================
-# 7. SEARCH ENGINES, AUTOMATED INDEXING API & TELEGRAM NOTIFICATIONS
+# 7. SEARCH ENGINES, INDEXING API & TELEGRAM NOTIFICATIONS
 # =====================================================================
 def notify_search_engines(post_url: str):
     try:
@@ -306,7 +326,6 @@ def notify_google_indexing_api(post_url: str):
                 scopes=["https://www.googleapis.com/auth/indexing"]
             )
         else:
-            print(" -> Indexing API skipped: No service_account.json found in environment.")
             return
 
         auth_req = Request()
@@ -322,13 +341,9 @@ def notify_google_indexing_api(post_url: str):
             "type": "URL_UPDATED"
         }
 
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
-        if response.status_code == 200:
-            print(" -> SUCCESS: Page automatically submitted to Google Indexing API!")
-        else:
-            print(f" -> Indexing API response: {response.text}")
-    except Exception as e:
-        print(f" -> Indexing API error: {e}")
+        requests.post(endpoint, headers=headers, json=payload, timeout=10)
+    except Exception:
+        pass
 
 def send_telegram_notification(song_name: str, movie_name: str, post_url: str, yt_id: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -378,7 +393,8 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
         body={"title": display_title, "content": final_html}
     ).execute()
 
-    # Notify search engines & actively push to Google Indexing API
+    # Log to local text file and trigger search engine indexing
+    log_posted_song(display_title, post_url)
     notify_search_engines(post_url)
     notify_google_indexing_api(post_url)
     return post_id, post_url
@@ -388,9 +404,9 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
 # =====================================================================
 if __name__ == "__main__":
     while True:
-        print("Checking live Blogger API for existing posts (deep history check)...")
+        print("Checking duplicate records (local log + Blogger API)...")
         existing_blog_titles = get_existing_blog_titles()
-        print(f" -> Found {len(existing_blog_titles)} existing posts live on Blogger.")
+        print(f" -> Total tracked songs in duplicate filter: {len(existing_blog_titles)}")
 
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
         new_song_published = False
@@ -410,10 +426,11 @@ if __name__ == "__main__":
             for entry in feed.entries:
                 clean_title = entry.title.lower().strip()
                 
+                # If song exists in either text file or Blogger, skip and check next song
                 if clean_title in existing_blog_titles:
                     continue
 
-                print(f"Found next unposted trending release: {entry.title}")
+                print(f"Found unique unposted trending release: {entry.title}")
                 scraped = extract_lyrics_and_video(entry)
                 
                 try:
