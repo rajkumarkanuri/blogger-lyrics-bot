@@ -177,10 +177,11 @@ def get_existing_blog_titles() -> set:
         page_token = None
         
         while True:
+            # Fixed orderBy to uppercase 'PUBLISHED' as required by Blogger API v3
             response = service.posts().list(
                 blogId=BLOG_ID, 
                 maxResults=100, 
-                orderBy="published",
+                orderBy="PUBLISHED",
                 pageToken=page_token
             ).execute()
             
@@ -196,16 +197,6 @@ def get_existing_blog_titles() -> set:
         print(f" -> Warning fetching Blogger API posts: {e}")
 
     return existing_titles
-
-def log_posted_song(song_title: str, post_url: str):
-    """Appends the newly published song title and link to the local text file."""
-    try:
-        with open(POSTED_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{song_title.lower().strip()}|{post_url}\n")
-        print(f" -> Logged song to {POSTED_LOG_FILE}")
-    except Exception as e:
-        print(f" -> Error writing to local log: {e}")
-
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
