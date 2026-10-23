@@ -15,13 +15,17 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 # =====================================================================
-# 1. CONFIGURATION & KEYS
+# 1. CONFIGURATION & MULTIPLE HIGH-TRAFFIC SOURCE FEEDS
 # =====================================================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BLOG_ID = "2717892436749933785"
 
-# Primary high-authority feed source for new Telugu releases
-MASTER_FEED = "https://www.telugulyricsworld.in/feeds/posts/default?alt=rss"
+# Multiple high-authority feeds to capture trending & classic hits quickly
+SOURCE_FEEDS = [
+    "https://www.telugulyricsworld.in/feeds/posts/default?alt=rss",
+    "https://telugulyricspage.blogspot.com/feeds/posts/default?alt=rss",
+    "http://telugupatalalyrics.blogspot.com/feeds/posts/default?alt=rss"
+]
 
 # =====================================================================
 # 2. STRUCTURED SEO SCHEMA FOR GEMINI
@@ -97,7 +101,7 @@ def extract_lyrics_and_video(entry) -> dict:
 
     return {
         "title": entry.title,
-        # Truncate plain text sharply to save AI input tokens
+        # Sharp truncation to drastically lower token usage
         "plain_text": soup.get_text(separator="\n", strip=True)[:1200],
         "youtube_id": yt_id,
         "telugu_html": "<p><br /></p>".join(telugu_blocks),
@@ -250,7 +254,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 </div>"""
 
 # =====================================================================
-# 7. NOTIFICATIONS & PUBLISHING
+# 7. SEARCH ENGINES, INDEXING API & TELEGRAM NOTIFICATIONS
 # =====================================================================
 def notify_search_engines(post_url: str):
     try:
@@ -260,6 +264,35 @@ def notify_search_engines(post_url: str):
         requests.get(f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url)}", timeout=5)
     except Exception:
         pass
+
+def notify_google_indexing_api(post_url: str):
+    """Pushes URL directly to Google Indexing API for immediate crawling."""
+    try:
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", scopes=["https://www.googleapis.com/auth/indexing"])
+        else:
+            creds = Credentials.from_authorized_user_info(
+                json.loads(os.environ["BLOGGER_TOKEN_JSON"]), 
+                scopes=["https://www.googleapis.com/auth/indexing"]
+            )
+
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+
+        endpoint = "https://indexing.googleapis.com/v3/urlNotifications:publish"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {creds.token}"
+        }
+        payload = {"url": post_url, "type": "URL_UPDATED"}
+
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            print(" -> Successfully notified Google Indexing API!")
+        else:
+            print(f" -> Indexing API response: {response.text}")
+    except Exception as e:
+        print(f" -> Indexing API error: {e}")
 
 def send_telegram_notification(song_name: str, movie_name: str, post_url: str, yt_id: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -310,10 +343,11 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
     ).execute()
 
     notify_search_engines(post_url)
+    notify_google_indexing_api(post_url)
     return post_id, post_url
 
 # =====================================================================
-# 8. CONTINUOUS HOURLY CHECKER WORKER LOOP
+# 8. CONTINUOUS HOURLY MULTI-SOURCE WORKER LOOP
 # =====================================================================
 if __name__ == "__main__":
     while True:
@@ -322,29 +356,28 @@ if __name__ == "__main__":
         print(f" -> Found {len(existing_blog_titles)} existing posts live on Blogger.")
 
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        
-        print(f"Checking master feed for new releases: {MASTER_FEED} ...")
-        try:
-            resp = requests.get(MASTER_FEED, headers=headers, timeout=15)
-            feed = feedparser.parse(resp.content)
-            print(f" -> Found {len(feed.entries)} total entries in feed.")
-        except Exception as e:
-            print(f" -> Error fetching feed: {e}")
-            feed = None
+        new_song_published = False
 
-        if feed:
-            new_song_published = False
+        for feed_url in SOURCE_FEEDS:
+            print(f"Scanning source feed: {feed_url} ...")
+            try:
+                resp = requests.get(feed_url, headers=headers, timeout=15)
+                feed = feedparser.parse(resp.content)
+            except Exception as e:
+                print(f" -> Error fetching feed {feed_url}: {e}")
+                continue
+
             for entry in feed.entries:
                 clean_title = entry.title.lower().strip()
                 
-                # Strict check against your live blog posts (Zero duplicates)
+                # Strict live check prevents duplicates across multiple sources
                 if clean_title in existing_blog_titles:
-                    continue  # Skip already posted songs quietly
+                    continue
 
-                print(f"Found brand new trending release: {entry.title}")
+                print(f"Found unique trending release: {entry.title}")
                 scraped = extract_lyrics_and_video(entry)
                 
-                # Generate token-efficient SEO content
+                # Token-efficient AI SEO generation
                 seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
 
                 html_template = build_template_html(scraped, seo_data)
@@ -359,10 +392,13 @@ if __name__ == "__main__":
                 send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, scraped['youtube_id'])
 
                 new_song_published = True
-                break  # Publish one trending song per hourly check
+                break  # Process one new unique song per cycle
 
-            if not new_song_published:
-                print("No new trending songs found in this hourly check.")
+            if new_song_published:
+                break
 
-        print("Waiting 1 hour before next release check...")
-        time.sleep(3600)  # Checks every 1 hour (3600 seconds)
+        if not new_song_published:
+            print("No new unique songs found across feeds in this hourly check.")
+
+        print("Waiting 1 hour before next multi-source release check...")
+        time.sleep(3600)  # Runs every hour
