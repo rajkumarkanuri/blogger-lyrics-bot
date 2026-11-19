@@ -2,7 +2,6 @@ import os
 import re
 import json
 import urllib.parse
-import time
 from datetime import datetime, timezone
 import requests
 import feedparser
@@ -11,7 +10,6 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
@@ -22,11 +20,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BLOG_ID = "2717892436749933785"
 POSTED_LOG_FILE = "posted_songs.txt"
 
-# Multiple high-authority feeds to capture trending & classic hits quickly
 SOURCE_FEEDS = [
     "https://www.telugulyricsworld.in/feeds/posts/default?alt=rss",
     "https://telugulyricspage.blogspot.com/feeds/posts/default?alt=rss",
-    "http://telugupatalalyrics.blogspot.com/feeds/posts/default?alt=rss"
+    "http://telugupatalalyrics.blogspot.com/feeds/posts/default?alt=rss",
 ]
 
 # =====================================================================
@@ -71,7 +68,7 @@ def extract_lyrics_and_video(entry) -> dict:
     yt_id = ""
     yt_match = re.search(
         r"(?:youtube\.com/embed/|youtube\.com/watch\?v=|youtu\.be/|img\.youtube\.com/vi/)([a-zA-Z0-9_-]{11})",
-        raw_html
+        raw_html,
     )
     if yt_match:
         yt_id = yt_match.group(1)
@@ -106,18 +103,18 @@ def extract_lyrics_and_video(entry) -> dict:
         "plain_text": soup.get_text(separator="\n", strip=True)[:1200],
         "youtube_id": yt_id,
         "telugu_html": "<p><br /></p>".join(telugu_blocks),
-        "english_html": "<p><br /></p>".join(english_blocks)
+        "english_html": "<p><br /></p>".join(english_blocks),
     }
 
 # =====================================================================
-# 4. TOKEN-EFFICIENT GEMINI SEO GENERATION (WITH AUTO-RETRY)
+# 4. GEMINI SEO GENERATION
 # =====================================================================
 def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
     Extract song credits and generate structured JSON for: {title}
     Text snippet: {plain_text}
-    
+
     Requirements:
     - Identify exact 'song_name', 'movie_name', 'singer', 'composer', 'music', 'lyricist', 'actors', 'director', 'label'.
     - 'seo_meta_description': 140-155 characters SEO description for "{title}".
@@ -126,55 +123,72 @@ def generate_unique_seo_data(title: str, plain_text: str) -> SongPostData:
     - 'labels': 7 short category labels.
     """
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            final_res = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=SongPostData,
-                )
-            )
-            return SongPostData.model_validate_json(final_res.text)
-        except Exception as e:
-            print(f" -> Gemini API temporary error (Attempt {attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(10)
-            else:
-                raise e
+    final_res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SongPostData,
+        ),
+    )
+    return SongPostData.model_validate_json(final_res.text)
 
 # =====================================================================
-# 5. PERMANENT LOCAL TEXT LOG DUPLICATE PREVENTION
+# 5. REPO-PERSISTED LOG + BLOGGER SEED DUPLICATE CHECK
 # =====================================================================
-def get_existing_blog_titles() -> set:
-    existing_titles = set()
-    
-    # Load from local text file (posted_songs.txt)
+def get_existing_titles() -> set:
+    existing = set()
+
     if os.path.exists(POSTED_LOG_FILE):
+        with open(POSTED_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = [p.strip().lower() for p in line.strip().split("|")]
+                if parts and parts[0]:
+                    existing.add(parts[0])
+                if len(parts) >= 3 and parts[2]:
+                    existing.add(parts[2])
+        print(f" -> Loaded {len(existing)} tracked title keys from {POSTED_LOG_FILE}.")
+
+    if not existing:
+        print(" -> Log empty/missing. Seeding from live Blogger posts...")
         try:
-            with open(POSTED_LOG_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split("|")
-                    if parts and parts[0]:
-                        existing_titles.add(parts[0].lower().strip())
-            print(f" -> Loaded {len(existing_titles)} posted songs from local log ({POSTED_LOG_FILE}).")
+            if os.path.exists("token.json"):
+                creds = Credentials.from_authorized_user_file("token.json")
+            else:
+                creds = Credentials.from_authorized_user_info(json.loads(os.environ["BLOGGER_TOKEN_JSON"]))
+
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+
+            service = build("blogger", "v3", credentials=creds)
+            page_token = None
+            while True:
+                resp = service.posts().list(
+                    blogId=BLOG_ID,
+                    maxResults=100,
+                    orderBy="PUBLISHED",
+                    pageToken=page_token,
+                ).execute()
+                for item in resp.get("items", []):
+                    if "title" in item:
+                        existing.add(item["title"].lower().strip())
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+
+            with open(POSTED_LOG_FILE, "w", encoding="utf-8") as f:
+                for t in sorted(existing):
+                    f.write(f"{t}|synced_from_blogger|\n")
+            print(f" -> Seeded {len(existing)} titles into {POSTED_LOG_FILE}.")
         except Exception as e:
-            print(f" -> Warning reading local log: {e}")
-    else:
-        print(f" -> No local log file found yet. A new {POSTED_LOG_FILE} will be created upon publication.")
+            print(f" -> Warning seeding from Blogger API: {e}")
 
-    return existing_titles
+    return existing
 
-def log_posted_song(song_title: str, post_url: str):
-    """Appends the newly published song title and link to the local text file."""
-    try:
-        with open(POSTED_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{song_title.lower().strip()}|{post_url}\n")
-        print(f" -> Logged song to {POSTED_LOG_FILE}")
-    except Exception as e:
-        print(f" -> Error writing to local log: {e}")
+def log_posted_song(feed_title: str, post_url: str, display_title: str):
+    with open(POSTED_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{feed_title.lower().strip()}|{post_url}|{display_title.lower().strip()}\n")
+
 # =====================================================================
 # 6. YOUTUBE FALLBACK & HTML BUILDER
 # =====================================================================
@@ -197,8 +211,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 
     yt_id = scraped["youtube_id"]
     if not yt_id:
-        search_query = f"{s_name} {m_name} Telugu lyrical song"
-        yt_id = find_youtube_video_id(search_query)
+        yt_id = find_youtube_video_id(f"{s_name} {m_name} Telugu lyrical song")
 
     thumb_url = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
     linked_song = f'<a href="{{{{POST_URL}}}}" title="{s_name} Lyrics">{s_name}</a>'
@@ -215,7 +228,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
         faq_schema_list.append({
             "@type": "Question",
             "name": faq.question,
-            "acceptedAnswer": {"@type": "Answer", "text": faq.answer}
+            "acceptedAnswer": {"@type": "Answer", "text": faq.answer},
         })
 
     json_ld_data = {
@@ -228,9 +241,9 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
                 "description": data.seo_meta_description,
                 "thumbnailUrl": [thumb_url],
                 "uploadDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "embedUrl": f"https://www.youtube.com/embed/{yt_id}"
-            }
-        ]
+                "embedUrl": f"https://www.youtube.com/embed/{yt_id}",
+            },
+        ],
     }
     json_ld_script = f'<script type="application/ld+json">{json.dumps(json_ld_data, ensure_ascii=False)}</script>'
 
@@ -269,7 +282,7 @@ def build_template_html(scraped: dict, data: SongPostData) -> str:
 </div>"""
 
 # =====================================================================
-# 7. SEARCH ENGINES, INDEXING API & TELEGRAM NOTIFICATIONS
+# 7. SEARCH ENGINE PINGS & TELEGRAM NOTIFICATIONS
 # =====================================================================
 def notify_search_engines(post_url: str):
     try:
@@ -280,57 +293,28 @@ def notify_search_engines(post_url: str):
     except Exception:
         pass
 
-def notify_google_indexing_api(post_url: str):
-    """Actively pushes the newly published URL to Google's live Indexing API queue."""
-    try:
-        if os.path.exists("service_account.json"):
-            creds = service_account.Credentials.from_service_account_file(
-                "service_account.json", 
-                scopes=["https://www.googleapis.com/auth/indexing"]
-            )
-        elif "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ:
-            creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-            creds = service_account.Credentials.from_service_account_info(
-                creds_info, 
-                scopes=["https://www.googleapis.com/auth/indexing"]
-            )
-        else:
-            return
-
-        auth_req = Request()
-        creds.refresh(auth_req)
-
-        endpoint = "https://indexing.googleapis.com/v3/urlNotifications:publish"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {creds.token}"
-        }
-        payload = {
-            "url": post_url,
-            "type": "URL_UPDATED"
-        }
-
-        requests.post(endpoint, headers=headers, json=payload, timeout=10)
-    except Exception:
-        pass
-
 def send_telegram_notification(song_name: str, movie_name: str, post_url: str, yt_id: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not bot_token or not chat_id:
         return
 
-    message = f"🎵 <b>New Telugu Song Lyrics Published!</b>\n\n" \
-              f"✨ <b>{song_name}</b> - <i>{movie_name}</i>\n\n" \
-              f"📖 Read & Watch here:\n<a href='{post_url}'>Click here to view lyrics</a>"
-
+    message = (
+        f"🎵 <b>New Telugu Song Lyrics Published!</b>\n\n"
+        f"✨ <b>{song_name}</b> - <i>{movie_name}</i>\n\n"
+        f"📖 Read & Watch here:\n<a href='{post_url}'>Click here to view lyrics</a>"
+    )
     thumb_url = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
     payload = {"chat_id": chat_id, "photo": thumb_url, "caption": message, "parse_mode": "HTML"}
 
     try:
         resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendPhoto", json=payload, timeout=10)
         if resp.status_code != 200:
-            requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
+            requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=10,
+            )
     except Exception:
         pass
 
@@ -347,7 +331,7 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
     created = service.posts().insert(
         blogId=blog_id,
         body={"kind": "blogger#post", "title": url_slug_title, "content": raw_html, "labels": labels},
-        isDraft=False
+        isDraft=False,
     ).execute()
 
     post_id = created["id"]
@@ -359,71 +343,51 @@ def publish_to_blogspot(blog_id: str, url_slug_title: str, display_title: str, r
     service.posts().patch(
         blogId=blog_id,
         postId=post_id,
-        body={"title": display_title, "content": final_html}
+        body={"title": display_title, "content": final_html},
     ).execute()
 
-    # Log to local text file and trigger search engine indexing
-    log_posted_song(display_title, post_url)
     notify_search_engines(post_url)
-    notify_google_indexing_api(post_url)
     return post_id, post_url
 
 # =====================================================================
-# 8. CONTINUOUS HOURLY MULTI-SOURCE WORKER LOOP
+# 8. SINGLE BATCH EXECUTION FOR GITHUB ACTIONS
 # =====================================================================
-if __name__ == "__main__":
-    while True:
-        print("Checking duplicate records (local log + Blogger API)...")
-        existing_blog_titles = get_existing_blog_titles()
-        print(f" -> Total tracked songs in duplicate filter: {len(existing_blog_titles)}")
+def run_once():
+    existing_titles = get_existing_titles()
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        new_song_published = False
+    for feed_url in SOURCE_FEEDS:
+        print(f"Scanning source feed: {feed_url} ...")
+        try:
+            resp = requests.get(feed_url, headers=headers, timeout=15)
+            feed = feedparser.parse(resp.content)
+        except Exception as e:
+            print(f" -> Error fetching feed {feed_url}: {e}")
+            continue
 
-        for feed_url in SOURCE_FEEDS:
-            if new_song_published:
-                break
-                
-            print(f"Scanning source feed: {feed_url} ...")
-            try:
-                resp = requests.get(feed_url, headers=headers, timeout=15)
-                feed = feedparser.parse(resp.content)
-            except Exception as e:
-                print(f" -> Error fetching feed {feed_url}: {e}")
+        for entry in feed.entries:
+            clean_title = entry.title.lower().strip()
+            if clean_title in existing_titles:
                 continue
 
-            for entry in feed.entries:
-                clean_title = entry.title.lower().strip()
-                
-                # If song exists in either text file or Blogger, skip and check next song
-                if clean_title in existing_blog_titles:
-                    continue
+            print(f"Found unique unposted song: {entry.title}")
+            scraped = extract_lyrics_and_video(entry)
+            seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
 
-                print(f"Found unique unposted trending release: {entry.title}")
-                scraped = extract_lyrics_and_video(entry)
-                
-                try:
-                    seo_data = generate_unique_seo_data(scraped["title"], scraped["plain_text"])
-                except Exception as ai_err:
-                    print(f" -> Skipping song due to AI error, trying next entry: {ai_err}")
-                    continue
+            html_template = build_template_html(scraped, seo_data)
+            url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
+            display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
 
-                html_template = build_template_html(scraped, seo_data)
-                url_slug_title = f"{seo_data.song_name} Lyrics {seo_data.movie_name} Telugu"
-                display_title = f"{seo_data.song_name} Lyrics in Telugu & English - {seo_data.movie_name} | {seo_data.composer}"
+            post_id, post_url = publish_to_blogspot(
+                BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
+            )
+            print(f"Published! Post ID: {post_id} | URL: {post_url}")
 
-                post_id, post_url = publish_to_blogspot(
-                    BLOG_ID, url_slug_title, display_title, html_template, seo_data.labels
-                )
-                print(f"Published Unique Song! Post ID: {post_id} | Live URL: {post_url}")
+            log_posted_song(entry.title, post_url, display_title)
+            send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, scraped["youtube_id"])
+            return
 
-                send_telegram_notification(seo_data.song_name, seo_data.movie_name, post_url, scraped['youtube_id'])
+    print("No new unique songs found across feeds.")
 
-                new_song_published = True
-                break  
-
-        if not new_song_published:
-            print("No new unique songs found across feeds in this hourly check.")
-
-        print("Waiting 1 hour before next multi-source release check...")
-        time.sleep(3600)
+if __name__ == "__main__":
+    run_once()
